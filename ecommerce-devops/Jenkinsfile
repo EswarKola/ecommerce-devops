@@ -1,0 +1,94 @@
+pipeline {
+  agent any
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+  environment {
+    AWS_REGION = 'ap-south-1'
+    EKS_CLUSTER_NAME = 'REPLACE_WITH_EKS_CLUSTER_NAME'
+    ECR_BACKEND_REPO = 'ecommerce-backend'
+    ECR_FRONTEND_REPO = 'ecommerce-frontend'
+    K8S_NAMESPACE = 'ecommerce'
+  }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'git rev-parse --short HEAD'
+      }
+    }
+    stage('Backend tests') {
+      steps {
+        dir('backend') {
+          sh '''
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install -r requirements.txt
+            pytest -q
+          '''
+        }
+      }
+    }
+    stage('Frontend build') {
+      steps {
+        dir('frontend') {
+          sh 'npm install && npm run build'
+        }
+      }
+    }
+    stage('Build and push images') {
+      when { branch 'main' }
+      steps {
+        withCredentials([
+          string(credentialsId: 'aws-account-id', variable: 'AWS_ACCOUNT_ID')
+        ]) {
+          sh '''
+            set -eu
+            REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            IMAGE_TAG="$(git rev-parse --short=12 HEAD)"
+            aws sts get-caller-identity
+            aws ecr get-login-password --region "$AWS_REGION" |
+              docker login --username AWS --password-stdin "$REGISTRY"
+            docker build -t "$REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG" backend
+            docker build -t "$REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG" frontend
+            docker push "$REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG"
+            docker push "$REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG"
+            echo "$IMAGE_TAG" > image-tag.txt
+          '''
+          stash name: 'image-tag', includes: 'image-tag.txt'
+        }
+      }
+    }
+    stage('Deploy to EKS') {
+      when { branch 'main' }
+      steps {
+        withCredentials([
+          string(credentialsId: 'aws-account-id', variable: 'AWS_ACCOUNT_ID'),
+          string(credentialsId: 'db-host', variable: 'DB_HOST')
+        ]) {
+          unstash 'image-tag'
+          sh '''
+            set -eu
+            IMAGE_TAG="$(cat image-tag.txt)"
+            REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+            kubectl apply -f k8s/namespace.yaml
+            sed "s|BACKEND_IMAGE_PLACEHOLDER|$REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG|g; s|REPLACE_WITH_RDS_ENDPOINT|$DB_HOST|g" k8s/backend.yaml | kubectl apply -f -
+            sed "s|FRONTEND_IMAGE_PLACEHOLDER|$REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG|g" k8s/frontend.yaml | kubectl apply -f -
+            kubectl rollout status deployment/backend -n "$K8S_NAMESPACE" --timeout=180s
+            kubectl rollout status deployment/frontend -n "$K8S_NAMESPACE" --timeout=180s
+            kubectl get pods,services -n "$K8S_NAMESPACE"
+          '''
+        }
+      }
+    }
+  }
+  post {
+    always {
+      sh 'rm -f image-tag.txt || true'
+      echo 'Review the stage logs to confirm success or diagnose failure.'
+    }
+  }
+}
